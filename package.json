@@ -1,0 +1,61 @@
+{
+  "name": "mcp-dual",
+  "version": "0.1.0",
+  "description": "Stateless MCP (2026-07-28) migration kit for TypeScript: live compatibility probe, dual-era shim proxy, and TS codemod.",
+  "author": "Inkwon Jung (https://github.com/developjik)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/developjik/mcp-dual.git"
+  },
+  "homepage": "https://github.com/developjik/mcp-dual#readme",
+  "bugs": {
+    "url": "https://github.com/developjik/mcp-dual/issues"
+  },
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "bin": {
+    "mcp-dual": "dist/bin/cli.js"
+  },
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "default": "./dist/src/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "pretest": "npm run build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run typecheck && npm run build && npm test"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "stateless",
+    "migration",
+    "codemod",
+    "proxy",
+    "shim",
+    "compatibility",
+    "typescript"
+  ],
+  "dependencies": {
+    "typescript": "^5.9.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.9",
+    "vitest": "^2.1.9"
+  }
+}
