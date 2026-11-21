@@ -182,7 +182,7 @@ mcp-dual codemod src --write            # apply
 mcp-dual codemod src --json --dry-run    # machine-readable change list
 ```
 
-Automatic, syntax-preserving fixes (TypeScript compiler API, no runtime deps):
+Automatic, syntax-preserving fixes (TypeScript compiler API; the only runtime dependency is `typescript`):
 
 - add `resultType: "complete"` to returned tool results;
 - add `ttlMs: 0` / `cacheScope: "private"` to returned list and read results;
