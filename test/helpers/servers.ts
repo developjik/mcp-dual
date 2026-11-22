@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from "node:net";
 import { ERROR_CODES, PREVIOUS_SPEC_VERSION, SPEC_VERSION } from "../../src/version.js";
 import { decodeHeaderValue } from "../../src/http.js";
+import type { JsonRpcMessage } from "../../src/types.js";
 
 export interface RecordedRequest {
   method: string;
@@ -49,6 +50,18 @@ async function listen(server: Server): Promise<number> {
 
 export interface ModernServerOptions {
   tools?: Array<Record<string, unknown>>;
+  /** Notifications streamed on the tools/call SSE response before the result. */
+  callNotifications?: JsonRpcMessage[];
+  /** Result payload returned by tools/call instead of the echo result. */
+  callResult?: Record<string, unknown>;
+  /** Messages emitted when subscriptions/listen opens an SSE stream. */
+  listenEvents?: JsonRpcMessage[];
+}
+
+function writeSse(response: ServerResponse, messages: unknown[]): void {
+  for (const message of messages) {
+    response.write(`data: ${JSON.stringify(message)}\n\n`);
+  }
 }
 
 /**
@@ -154,11 +167,27 @@ export async function startModernServer(options: ModernServerOptions = {}): Prom
         case "tools/call": {
           const args = (params.arguments ?? {}) as Record<string, unknown>;
           const text = typeof args.text === "string" ? args.text : JSON.stringify(args);
-          send(response, 200, {
-            jsonrpc: "2.0",
-            id,
-            result: { resultType: "complete", content: [{ type: "text", text: `echo:${text}` }] },
-          });
+          const callResult = options.callResult ?? {
+            resultType: "complete",
+            content: [{ type: "text", text: `echo:${text}` }],
+          };
+          if (options.callNotifications) {
+            response.writeHead(200, { "content-type": "text/event-stream" });
+            writeSse(response, [...options.callNotifications, { jsonrpc: "2.0", id, result: callResult }]);
+            response.end();
+            return;
+          }
+          send(response, 200, { jsonrpc: "2.0", id, result: callResult });
+          return;
+        }
+        case "subscriptions/listen": {
+          if (!options.listenEvents) {
+            send(response, 404, rpcError(id, ERROR_CODES.methodNotFound, "Method not found: subscriptions/listen"));
+            return;
+          }
+          response.writeHead(200, { "content-type": "text/event-stream" });
+          writeSse(response, options.listenEvents);
+          response.end();
           return;
         }
         default: {
@@ -182,7 +211,12 @@ export async function startModernServer(options: ModernServerOptions = {}): Prom
  * A 2025-11-25 style server: initialize + Mcp-Session-Id, tools/list without
  * resultType or cache hints, no server/discover.
  */
-export async function startLegacyServer(): Promise<MockServer> {
+export interface LegacyServerOptions {
+  /** When set, GET opens an SSE stream emitting these messages (session-scoped legacy stream). */
+  getStreamEvents?: JsonRpcMessage[];
+}
+
+export async function startLegacyServer(options: LegacyServerOptions = {}): Promise<MockServer> {
   const requests: RecordedRequest[] = [];
   let currentSession: string | undefined;
   let counter = 0;
@@ -190,7 +224,14 @@ export async function startLegacyServer(): Promise<MockServer> {
   const server = createServer((request, response) => {
     void (async () => {
       if (request.method === "GET") {
-        response.writeHead(405).end();
+        if (!options.getStreamEvents) {
+          response.writeHead(405).end();
+          return;
+        }
+        requests.push({ method: "GET", path: request.url ?? "", headers: request.headers });
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        writeSse(response, options.getStreamEvents);
+        response.end();
         return;
       }
       const raw = await readBody(request);

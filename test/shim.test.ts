@@ -1,6 +1,7 @@
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 import { startShim, type RunningShim } from "../src/shim.js";
+import { parseSseEvents } from "../src/http.js";
 import type { JsonRpcMessage } from "../src/types.js";
 import { startLegacyServer, startModernServer } from "./helpers/servers.js";
 
@@ -151,6 +152,194 @@ describe("shim: modern client → legacy server", () => {
 
     // The legacy session id is kept by the shim, not exposed to the modern client.
     expect(legacy.requests.some((request) => request.headers["mcp-session-id"] !== undefined)).toBe(true);
+  });
+});
+
+describe("shim: SSE notification relay", () => {
+  const progress = {
+    jsonrpc: "2.0" as const,
+    method: "notifications/progress",
+    params: { progressToken: "t1", progress: 0.5, total: 1 },
+  };
+  const message = {
+    jsonrpc: "2.0" as const,
+    method: "notifications/message",
+    params: { level: "info", data: "half way" },
+  };
+
+  async function post(url: string, body: JsonRpcMessage, headers: Record<string, string> = {}): Promise<Response> {
+    return fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream", ...headers },
+      body: JSON.stringify(body),
+    });
+  }
+
+  it("relays progress/message notifications to a modern client as SSE", async () => {
+    const modern = await track(await startModernServer({ callNotifications: [progress, message] }));
+    const shim = await startProtocolShim({ port: 0, upstreamHttp: modern.url });
+
+    const response = await post(shim.url, {
+      jsonrpc: "2.0",
+      id: 9,
+      method: "tools/call",
+      params: { name: "echo", arguments: { text: "hi" } },
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("text/event-stream");
+    const events = parseSseEvents(await response.text());
+    expect(events.map((entry) => entry.method)).toEqual([
+      "notifications/progress",
+      "notifications/message",
+      undefined,
+    ]);
+    const final = events.at(-1);
+    expect(final?.id).toBe(9);
+    expect((final?.result as Record<string, unknown>).resultType).toBe("complete");
+  });
+
+  it("relays progress/message notifications to a legacy client as SSE", async () => {
+    const modern = await track(await startModernServer({ callNotifications: [progress, message] }));
+    const shim = await startProtocolShim({ port: 0, upstreamHttp: modern.url });
+
+    const initialize = await rpc(shim.url, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2025-11-25", capabilities: {} },
+    });
+    const sessionId = initialize.headers.get("mcp-session-id") as string;
+
+    const response = await post(
+      shim.url,
+      { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: { text: "hi" } } },
+      { "mcp-session-id": sessionId },
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("text/event-stream");
+    const events = parseSseEvents(await response.text());
+    expect(events.map((entry) => entry.method)).toEqual([
+      "notifications/progress",
+      "notifications/message",
+      undefined,
+    ]);
+    expect(events.at(-1)?.id).toBe(2);
+  });
+
+  it("keeps a plain JSON response when the upstream streams no notifications", async () => {
+    const modern = await track(await startModernServer());
+    const shim = await startProtocolShim({ port: 0, upstreamHttp: modern.url });
+    const response = await post(shim.url, { jsonrpc: "2.0", id: 3, method: "tools/list", params: {} });
+    expect(response.headers.get("content-type")).toContain("application/json");
+  });
+});
+
+describe("shim: subscriptions/listen", () => {
+  it("bridges listen to the legacy upstream GET stream", async () => {
+    const legacy = await track(
+      await startLegacyServer({
+        getStreamEvents: [
+          {
+            jsonrpc: "2.0",
+            method: "notifications/resources/updated",
+            params: { uri: "res://watched" },
+          },
+        ],
+      }),
+    );
+    const shim = await startProtocolShim({ port: 0, upstreamHttp: legacy.url });
+
+    // A modern client must discover the shim first so the upstream session exists.
+    await rpc(shim.url, { jsonrpc: "2.0", id: 1, method: "server/discover", params: {} });
+
+    const response = await fetch(shim.url, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "subscriptions/listen", params: {} }),
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("text/event-stream");
+    const events = parseSseEvents(await response.text());
+    expect(events[0]?.method).toBe("notifications/resources/updated");
+    expect((events[0]?.params as Record<string, unknown>).uri).toBe("res://watched");
+
+    // The bridge issued a GET against the legacy upstream carrying its session id.
+    const get = legacy.requests.find((entry) => entry.method === "GET");
+    expect(get).toBeDefined();
+    expect(String(get?.headers["mcp-session-id"])).toMatch(/^legacy-session-/);
+  });
+
+  it("passes listen through to a stateless upstream stream", async () => {
+    const modern = await track(
+      await startModernServer({
+        listenEvents: [{ jsonrpc: "2.0", method: "notifications/message", params: { level: "info", data: "hi" } }],
+      }),
+    );
+    const shim = await startProtocolShim({ port: 0, upstreamHttp: modern.url });
+
+    const response = await fetch(shim.url, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 7, method: "subscriptions/listen", params: {} }),
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("text/event-stream");
+    const events = parseSseEvents(await response.text());
+    expect(events[0]?.method).toBe("notifications/message");
+  });
+
+  it("returns the upstream reply when a stateless server rejects listen", async () => {
+    const modern = await track(await startModernServer());
+    const shim = await startProtocolShim({ port: 0, upstreamHttp: modern.url });
+    const outcome = await rpc(shim.url, { jsonrpc: "2.0", id: 8, method: "subscriptions/listen", params: {} });
+    const single = Array.isArray(outcome.body) ? outcome.body[0] : outcome.body;
+    expect(single?.error?.code).toBe(-32601);
+  });
+
+  it("returns 501 for a stdio upstream (documented unsupported)", async () => {
+    const shim = await startProtocolShim({
+      port: 0,
+      upstreamStdio: `node "${fixture("stdio-legacy.mjs")}"`,
+    });
+    const outcome = await rpc(shim.url, { jsonrpc: "2.0", id: 9, method: "subscriptions/listen", params: {} });
+    expect(outcome.status).toBe(501);
+    const single = Array.isArray(outcome.body) ? outcome.body[0] : outcome.body;
+    expect(single?.error?.code).toBe(-32601);
+  });
+});
+
+describe("shim: MRTR input_required scope", () => {
+  it("passes an input_required result through to a legacy client unchanged", async () => {
+    const modern = await track(
+      await startModernServer({
+        callResult: {
+          resultType: "input_required",
+          inputRequests: [
+            { method: "elicitation/create", params: { message: "confirm?" } },
+          ],
+        },
+      }),
+    );
+    const shim = await startProtocolShim({ port: 0, upstreamHttp: modern.url });
+
+    const initialize = await rpc(shim.url, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2025-11-25", capabilities: {} },
+    });
+    const sessionId = initialize.headers.get("mcp-session-id") as string;
+
+    const call = await rpc(
+      shim.url,
+      { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "echo", arguments: {} } },
+      { "mcp-session-id": sessionId },
+    );
+    const callResult = result(call.body);
+    // Defined scope: the shim relays MRTR payloads verbatim; it does not
+    // simulate sampling/elicitation for a legacy client.
+    expect(callResult.resultType).toBe("input_required");
+    expect((callResult.inputRequests as Array<{ method: string }>)[0]?.method).toBe("elicitation/create");
   });
 });
 

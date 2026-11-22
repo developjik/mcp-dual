@@ -225,9 +225,9 @@ The split is deliberate: Python teams keep using `mcp-migrate`, TypeScript teams
 
 ## Limits (v0.1)
 
-- **Streaming is flattened.** The shim returns the final JSON-RPC result of each request; request-scoped `notifications/progress` and `notifications/message` on an SSE response are not relayed yet. Long-running tools still work, but progress bars will not move through the shim.
-- **`subscriptions/listen` is not bridged** to a legacy upstream's GET stream (returns `501`). Stateless-to-stateless traffic passes it through untouched.
-- **MRTR is passed through, not simulated.** A modern server's `input_required` result reaches a modern client, but the shim does not convert it into sampling/elicitation requests for a legacy client.
+- **Request-scoped notifications are relayed as SSE.** When an upstream streams `notifications/progress` / `notifications/message` (or any other notification) on a response, the shim answers with a `text/event-stream` body carrying those notifications followed by the final replies — progress bars keep moving through the shim. A stdio upstream has no push channel; its notifications are queued and flushed alongside the next reply.
+- **`subscriptions/listen` is bridged for HTTP upstreams.** Against a stateless upstream it is a pass-through POST stream; against a legacy upstream the shim opens the session GET stream and pipes events. Upstreams without a server-initiated stream (a legacy server whose GET returns non-SSE, or any `--upstream-stdio`) still return `501`.
+- **MRTR is passed through, not simulated — by definition.** The conversion scope is transport-level relay only: an `input_required` result and its `inputRequests` reach the client verbatim (either era), and a retry carrying `inputResponses` is forwarded untouched. The shim does not turn `inputRequests` into legacy `sampling/createMessage` / `elicitation/create` calls, because that would require a server→client request channel the shim does not maintain.
 - **No authorization flows.** DCR/CIMD/OAuth are not implemented; use `--header` to attach credentials the probe and shim should send.
 - **Static rules are heuristics.** They are file-level pattern checks, not a full type-aware analysis; the live probe is the source of truth. `mcp-dual:ignore` markers exist for intentional legacy code.
 - **Codemod auto-fixes are conservative.** It will not delete a session store or invent a `server/discover` handler for you — those become TODOs.

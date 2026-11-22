@@ -1,6 +1,6 @@
 {
   "name": "mcp-dual",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Stateless MCP (2026-07-28) migration kit for TypeScript: live compatibility probe, dual-era shim proxy, and TS codemod.",
   "author": "Inkwon Jung (https://github.com/developjik)",
   "repository": {

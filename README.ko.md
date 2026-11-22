@@ -225,9 +225,9 @@ mcp-dual codemod src --json --dry-run    # 기계 판독 가능한 변경 목록
 
 ## 한계 (v0.1)
 
-- **스트리밍은 평탄화됩니다.** shim은 각 요청의 최종 JSON-RPC 결과를 반환하고, SSE 응답 위의 요청 범위 `notifications/progress`와 `notifications/message`는 아직 중계하지 않습니다. 오래 걸리는 툴은 여전히 동작하지만, 진행 표시줄은 shim을 거치며 움직이지 않습니다.
-- **`subscriptions/listen`은 레거시 업스트림의 GET 스트림으로 브리지되지 않습니다**(`501` 반환). 무상태↔무상태 트래픽에서는 그대로 통과합니다.
-- **MRTR은 통과시키되 시뮬레이션하지 않습니다.** 현대 서버의 `input_required` 결과는 현대 클라이언트에 도달하지만, shim이 그것을 레거시 클라이언트용 sampling/elicitation 요청으로 바꾸지는 않습니다.
+- **요청 범위 알림은 SSE로 중계됩니다.** 업스트림이 응답 위에 `notifications/progress`·`notifications/message`(또는 다른 알림)를 스트리밍하면, shim은 그 알림들 다음에 최종 응답을 담은 `text/event-stream` 본문으로 응답합니다 — 진행 표시줄이 shim을 거쳐서도 움직입니다. stdio 업스트림은 푸시 채널이 없으므로 알림을 큐에 쌓았다가 다음 응답에 함께 보냅니다.
+- **`subscriptions/listen`은 HTTP 업스트림에서 브리지됩니다.** 무상태 업스트림에는 POST 스트림 패스스루이고, 레거시 업스트림에는 shim이 세션 GET 스트림을 열어 이벤트를 파이프합니다. 서버 시작 스트림이 없는 업스트림(GET이 SSE가 아닌 레거시 서버, 모든 `--upstream-stdio`)은 여전히 `501`을 반환합니다.
+- **MRTR은 통과시키되 시뮬레이션하지 않습니다 — 이것이 정의된 범위입니다.** 변환 범위는 전송 계층 중계까지입니다: `input_required` 결과와 `inputRequests`는 어떤 시대의 클라이언트든 그대로 도달하고, `inputResponses`를 담은 재시도도 손대지 않고 전달합니다. `inputRequests`를 레거시 `sampling/createMessage`·`elicitation/create` 호출로 바꾸는 일은 shim이 유지하지 않는 서버→클라이언트 요청 채널을 필요로 하므로 범위 밖입니다.
 - **인증 플로 없음.** DCR/CIMD/OAuth는 구현되지 않았습니다. 프로브와 shim이 보내야 할 자격 증명은 `--header`로 붙이세요.
 - **정적 규칙은 휴리스틱입니다.** 파일 수준 패턴 검사이지 타입을 아는 전체 분석이 아닙니다. 진실은 라이브 프로브에 있습니다. 의도적인 레거시 코드를 위한 `mcp-dual:ignore` 마커가 있습니다.
 - **codemod 자동 수정은 보수적입니다.** 세션 저장소를 지우거나 `server/discover` 핸들러를 대신 만들어주지 않습니다 — 그런 것은 TODO가 됩니다.

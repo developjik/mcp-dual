@@ -7,6 +7,7 @@ import {
   makeNotification,
   makeRequest,
   parseJsonRpcBody,
+  parseSseEvents,
   postJsonRpc,
   requestMeta,
   standardHeaders,
@@ -55,15 +56,36 @@ export interface ShimOutcome {
   status: number;
   era: ClientEra;
   messages: JsonRpcMessage[];
+  /** Upstream notifications (progress, message, …) relayed alongside the reply. */
+  notifications?: JsonRpcMessage[];
+  /** Long-lived SSE body for subscriptions/listen, piped to the client verbatim. */
+  stream?: ReadableStream<Uint8Array>;
   sessionId?: string;
 }
+
+export interface UpstreamReply {
+  response: JsonRpcMessage;
+  /** Notifications the upstream streamed on the response channel. */
+  notifications: JsonRpcMessage[];
+}
+
+/** Result of opening a subscriptions/listen stream against an upstream. */
+export type UpstreamListen =
+  | { kind: "stream"; body: ReadableStream<Uint8Array> }
+  | { kind: "reply"; response: JsonRpcMessage };
 
 interface Upstream {
   readonly era: UpstreamEra | "unknown";
   ensureEra(): Promise<UpstreamEra>;
   discover(): Promise<Record<string, unknown>>;
-  sendModern(message: JsonRpcMessage, context: ClientContext): Promise<JsonRpcMessage>;
-  sendLegacy(message: JsonRpcMessage): Promise<JsonRpcMessage>;
+  sendModern(message: JsonRpcMessage, context: ClientContext): Promise<UpstreamReply>;
+  sendLegacy(message: JsonRpcMessage): Promise<UpstreamReply>;
+  /**
+   * Open a long-lived notification stream for `subscriptions/listen`:
+   * pass-through POST for a stateless upstream, GET stream for a legacy one.
+   * Absent on transports that have no server-initiated stream (stdio).
+   */
+  openListenStream?(): Promise<UpstreamListen | null>;
   serverInfo(): Record<string, unknown> | undefined;
   close(): Promise<void>;
 }
@@ -80,6 +102,11 @@ function serverInfoFrom(discover: Record<string, unknown> | undefined): Record<s
 
 function legacyVersion(requested: unknown): string {
   return typeof requested === "string" && requested.length > 0 ? requested : PREVIOUS_SPEC_VERSION;
+}
+
+/** Notifications streamed alongside a response (id-less, method-carrying messages). */
+function streamedNotifications(messages: JsonRpcMessage[], response: JsonRpcMessage | undefined): JsonRpcMessage[] {
+  return messages.filter((entry) => entry !== response && entry.id === undefined && typeof entry.method === "string");
 }
 
 function errorMessage(id: JsonRpcMessage["id"], code: number, message: string): JsonRpcMessage {
@@ -132,6 +159,7 @@ export class HttpUpstream implements Upstream {
   private initResult?: Record<string, unknown>;
   private discoverResult?: Record<string, unknown>;
   private nextId = 1;
+  private readonly streamAborters = new Set<AbortController>();
 
   constructor(
     private readonly url: string,
@@ -256,12 +284,31 @@ export class HttpUpstream implements Upstream {
     };
   }
 
-  async sendModern(message: JsonRpcMessage, context: ClientContext): Promise<JsonRpcMessage> {
+  async sendModern(message: JsonRpcMessage, context: ClientContext): Promise<UpstreamReply> {
     await this.ensureEra();
-    return this.modernRpc(message, context);
+    const translated = withRequestMeta(
+      message,
+      requestMeta({
+        ...(context.clientInfo ? { clientInfo: context.clientInfo } : {}),
+        ...(context.clientCapabilities ? { clientCapabilities: context.clientCapabilities } : {}),
+        ...(context.logLevel ? { logLevel: context.logLevel } : {}),
+      }),
+    );
+    const headers = standardHeaders(translated, { extra: this.headers });
+    const { exchange, response } = await this.rpc(translated, headers);
+    const resolved =
+      response ??
+      (message.id === undefined
+        ? message
+        : errorMessage(
+            message.id,
+            ERROR_CODES.internalError,
+            `upstream returned HTTP ${exchange.status}${exchange.bodyText.trim() ? `: ${exchange.bodyText.trim().slice(0, 300)}` : ""}`,
+          ));
+    return { response: resolved, notifications: streamedNotifications(exchange.messages, resolved) };
   }
 
-  async sendLegacy(message: JsonRpcMessage): Promise<JsonRpcMessage> {
+  async sendLegacy(message: JsonRpcMessage): Promise<UpstreamReply> {
     await this.ensureEra();
     const init = await this.initializeLegacy();
     const headers: Record<string, string> = {
@@ -275,13 +322,73 @@ export class HttpUpstream implements Upstream {
       sent.params = { ...sent.params, protocolVersion: legacyVersion(init.protocolVersion) };
     }
     const { exchange, response } = await this.rpc(sent, headers);
-    if (response) return response;
-    if (message.id === undefined) return message;
-    return errorMessage(
-      message.id,
-      ERROR_CODES.internalError,
-      `legacy upstream returned HTTP ${exchange.status}${exchange.bodyText.trim() ? `: ${exchange.bodyText.trim().slice(0, 300)}` : ""}`,
-    );
+    const resolved =
+      response ??
+      (message.id === undefined
+        ? message
+        : errorMessage(
+            message.id,
+            ERROR_CODES.internalError,
+            `legacy upstream returned HTTP ${exchange.status}${exchange.bodyText.trim() ? `: ${exchange.bodyText.trim().slice(0, 300)}` : ""}`,
+          ));
+    return { response: resolved, notifications: streamedNotifications(exchange.messages, resolved) };
+  }
+
+  async openListenStream(): Promise<UpstreamListen | null> {
+    const era = await this.ensureEra();
+    const aborter = new AbortController();
+    const timer = setTimeout(() => aborter.abort(), this.timeoutMs);
+    this.streamAborters.add(aborter);
+    try {
+      if (era === "modern") {
+        const message = makeRequest("subscriptions/listen", { _meta: requestMeta() }, this.nextId++);
+        const response = await fetch(this.url, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            accept: "application/json, text/event-stream",
+            ...standardHeaders(message, { extra: this.headers }),
+          },
+          body: JSON.stringify(message),
+          signal: aborter.signal,
+        });
+        if (response.ok && (response.headers.get("content-type") ?? "").includes("text/event-stream") && response.body) {
+          return { kind: "stream", body: response.body };
+        }
+        const text = await response.text();
+        const parsed = parseJsonRpcBody(text)[0];
+        this.streamAborters.delete(aborter);
+        return {
+          kind: "reply",
+          response:
+            parsed ??
+            errorMessage(
+              message.id,
+              ERROR_CODES.internalError,
+              `upstream returned HTTP ${response.status} for subscriptions/listen`,
+            ),
+        };
+      }
+      const init = await this.initializeLegacy();
+      const headers: Record<string, string> = {
+        accept: "text/event-stream",
+        [PROTOCOL_VERSION_HEADER]: legacyVersion(init.protocolVersion),
+        ...this.headers,
+      };
+      if (this.legacySessionId) headers[SESSION_HEADER] = this.legacySessionId;
+      const response = await fetch(this.url, { method: "GET", headers, signal: aborter.signal });
+      if (response.ok && (response.headers.get("content-type") ?? "").includes("text/event-stream") && response.body) {
+        return { kind: "stream", body: response.body };
+      }
+      await response.body?.cancel().catch(() => undefined);
+      this.streamAborters.delete(aborter);
+      return null;
+    } catch (error) {
+      this.streamAborters.delete(aborter);
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   serverInfo(): Record<string, unknown> | undefined {
@@ -289,7 +396,9 @@ export class HttpUpstream implements Upstream {
   }
 
   async close(): Promise<void> {
-    // Stateless upstream: nothing to close.
+    // Abort any listen streams still open so their fetches release sockets.
+    for (const aborter of this.streamAborters) aborter.abort();
+    this.streamAborters.clear();
   }
 }
 
@@ -299,6 +408,8 @@ export class StdioUpstream implements Upstream {
   private connection?: StdioConnection;
   private initResult?: Record<string, unknown>;
   private discoverResult?: Record<string, unknown>;
+  /** Notifications the stdio server emitted between replies; flushed on the next reply. */
+  private pendingNotifications: JsonRpcMessage[] = [];
 
   constructor(
     private readonly command: string,
@@ -309,7 +420,10 @@ export class StdioUpstream implements Upstream {
 
   private connect(): StdioConnection {
     if (!this.connection) {
-      this.connection = StdioConnection.start(this.command, this.cwd ? { cwd: this.cwd } : {});
+      this.connection = StdioConnection.start(this.command, {
+        ...(this.cwd ? { cwd: this.cwd } : {}),
+        onNotification: (message) => this.pendingNotifications.push(message),
+      });
     }
     return this.connection;
   }
@@ -374,7 +488,7 @@ export class StdioUpstream implements Upstream {
     };
   }
 
-  async sendModern(message: JsonRpcMessage, context: ClientContext): Promise<JsonRpcMessage> {
+  async sendModern(message: JsonRpcMessage, context: ClientContext): Promise<UpstreamReply> {
     await this.ensureEra();
     const translated = withRequestMeta(
       message,
@@ -384,13 +498,15 @@ export class StdioUpstream implements Upstream {
         ...(context.logLevel ? { logLevel: context.logLevel } : {}),
       }),
     );
-    return this.connect().send(translated, this.timeoutMs);
+    const response = await this.connect().send(translated, this.timeoutMs);
+    return { response, notifications: this.pendingNotifications.splice(0) };
   }
 
-  async sendLegacy(message: JsonRpcMessage): Promise<JsonRpcMessage> {
+  async sendLegacy(message: JsonRpcMessage): Promise<UpstreamReply> {
     await this.ensureEra();
     await this.initializeLegacy();
-    return this.connect().send(message, this.timeoutMs);
+    const response = await this.connect().send(message, this.timeoutMs);
+    return { response, notifications: this.pendingNotifications.splice(0) };
   }
 
   serverInfo(): Record<string, unknown> | undefined {
@@ -513,47 +629,44 @@ export class ShimEngine {
     }
 
     if (upstreamEra === "modern") {
-      const response = await this.upstream.sendModern(message, {
+      // A legacy client asking for a listen stream gets the same bridge as a
+      // modern one: the stateless upstream answers with an SSE response.
+      if (message.method === "subscriptions/listen") {
+        return this.listenOutcome("legacy", message.id);
+      }
+      const reply = await this.upstream.sendModern(message, {
         ...(session?.clientInfo ? { clientInfo: session.clientInfo } : {}),
         ...(session?.clientCapabilities ? { clientCapabilities: session.clientCapabilities } : {}),
         ...(session?.logLevel ? { logLevel: session.logLevel } : {}),
       });
       if (message.id === undefined) return { status: 202, era: "legacy", messages: [] };
-      return { status: 200, era: "legacy", messages: [response] };
+      return { status: 200, era: "legacy", messages: [reply.response], notifications: reply.notifications };
     }
 
-    const response = await this.upstream.sendLegacy(message);
+    const reply = await this.upstream.sendLegacy(message);
     if (message.id === undefined) return { status: 202, era: "legacy", messages: [] };
-    return { status: 200, era: "legacy", messages: [response] };
+    return { status: 200, era: "legacy", messages: [reply.response], notifications: reply.notifications };
   }
 
   private async handleModern(message: JsonRpcMessage): Promise<ShimOutcome> {
     const upstreamEra = await this.upstream.ensureEra();
 
+    // Handled before the stateless pass-through: a buffered send would wait on
+    // the long-lived SSE response instead of streaming it back to the client.
+    if (message.method === "subscriptions/listen") {
+      return this.listenOutcome("modern", message.id);
+    }
+
     if (upstreamEra === "modern") {
-      const response = await this.upstream.sendModern(message, {});
+      const reply = await this.upstream.sendModern(message, {});
       if (message.id === undefined) return { status: 202, era: "modern", messages: [] };
-      return { status: 200, era: "modern", messages: [response] };
+      return { status: 200, era: "modern", messages: [reply.response], notifications: reply.notifications };
     }
 
     if (message.method === "server/discover") {
       const discover = await this.upstream.discover();
       if (message.id === undefined) return { status: 202, era: "modern", messages: [] };
       return { status: 200, era: "modern", messages: [resultMessage(message.id, discover)] };
-    }
-
-    if (message.method === "subscriptions/listen") {
-      return {
-        status: 501,
-        era: "modern",
-        messages: [
-          errorMessage(
-            message.id,
-            ERROR_CODES.methodNotFound,
-            "subscriptions/listen is not bridged to a legacy upstream; the legacy server only has GET streams.",
-          ),
-        ],
-      };
     }
 
     if (message.method === "ping") {
@@ -564,12 +677,40 @@ export class ShimEngine {
       };
     }
 
-    const response = await this.upstream.sendLegacy(message);
+    const reply = await this.upstream.sendLegacy(message);
     if (message.id === undefined) return { status: 202, era: "modern", messages: [] };
     return {
       status: 200,
       era: "modern",
-      messages: [normalizeLegacyResult(message.method, response, this.upstream.serverInfo())],
+      messages: [normalizeLegacyResult(message.method, reply.response, this.upstream.serverInfo())],
+      notifications: reply.notifications,
+    };
+  }
+
+  /**
+   * subscriptions/listen → upstream stream bridge. Stateless upstreams get a
+   * pass-through POST; legacy HTTP upstreams are bridged to their session GET
+   * stream. Returns 501 when the transport has no server-initiated stream.
+   */
+  private async listenOutcome(era: ClientEra, id?: JsonRpcMessage["id"]): Promise<ShimOutcome> {
+    const open = this.upstream.openListenStream?.bind(this.upstream);
+    const opened = open ? await open() : null;
+    if (opened?.kind === "stream") {
+      return { status: 200, era, messages: [], stream: opened.body };
+    }
+    if (opened?.kind === "reply") {
+      return { status: 200, era, messages: [opened.response] };
+    }
+    return {
+      status: 501,
+      era,
+      messages: [
+        errorMessage(
+          id,
+          ERROR_CODES.methodNotFound,
+          "subscriptions/listen is not bridged: the upstream has no server-initiated stream.",
+        ),
+      ],
     };
   }
 
@@ -618,6 +759,55 @@ function writeJson(response: ServerResponse, status: number, payload: unknown, e
     ...extraHeaders,
   });
   response.end(body);
+}
+
+/** Emit JSON-RPC messages as a complete `text/event-stream` response. */
+function writeSseResponse(
+  response: ServerResponse,
+  status: number,
+  messages: JsonRpcMessage[],
+  extraHeaders: Record<string, string> = {},
+): void {
+  response.writeHead(status, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    ...extraHeaders,
+  });
+  for (const message of messages) {
+    response.write(`data: ${JSON.stringify(message)}\n\n`);
+  }
+  response.end();
+}
+
+/** Pipe an upstream SSE body to the client until it ends or the client disconnects. */
+async function pipeSseStream(
+  body: ReadableStream<Uint8Array>,
+  request: IncomingMessage,
+  response: ServerResponse,
+  extraHeaders: Record<string, string>,
+): Promise<void> {
+  response.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    ...extraHeaders,
+  });
+  const reader = body.getReader();
+  const onClose = (): void => {
+    void reader.cancel().catch(() => undefined);
+  };
+  request.once("close", onClose);
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value && value.length > 0 && !response.write(value)) {
+        await new Promise<void>((resolve) => response.once("drain", resolve));
+      }
+    }
+  } finally {
+    request.off("close", onClose);
+    response.end();
+  }
 }
 
 export interface RunningShim {
@@ -738,23 +928,41 @@ async function handleHttpRequest(
   }
 
   const messages: JsonRpcMessage[] = [];
+  const relayed: JsonRpcMessage[] = [];
   let status = 202;
   let responseSession: string | undefined;
   let era: ClientEra = "modern";
+  let listenStream: ReadableStream<Uint8Array> | undefined;
   for (const message of parsed) {
     const outcome = await engine.handle(message, sessionId);
     era = outcome.era;
+    if (outcome.stream) {
+      listenStream = outcome.stream;
+      status = outcome.status;
+    }
     if (outcome.messages.length > 0) {
       messages.push(...outcome.messages.filter((entry) => entry.id !== undefined || entry.error !== undefined));
       status = outcome.status;
     }
+    if (outcome.notifications) relayed.push(...outcome.notifications);
     if (outcome.sessionId) responseSession = outcome.sessionId;
   }
 
   const headers: Record<string, string> = {};
   if (responseSession) headers[SESSION_HEADER] = responseSession;
+  if (listenStream) {
+    await pipeSseStream(listenStream, request, response, headers);
+    options.log?.("subscriptions/listen bridged to an upstream stream");
+    return;
+  }
   if (messages.length === 0) {
     response.writeHead(status === 202 ? 202 : status, headers).end();
+    return;
+  }
+  if (relayed.length > 0) {
+    // Notifications first, then the replies — one SSE response, as the spec allows.
+    writeSseResponse(response, status, [...relayed, ...messages], headers);
+    options.log?.(`${parsed.length} message(s) relayed as ${era} traffic (+${relayed.length} notification(s))`);
     return;
   }
   if (parsed.length > 1) {
@@ -763,6 +971,34 @@ async function handleHttpRequest(
     writeJson(response, status, messages[0] ?? messages, headers);
   }
   options.log?.(`${parsed.length} message(s) relayed as ${era} traffic`);
+}
+
+/** Decode an SSE body and write each JSON-RPC message as a stdout line. */
+async function writeStreamAsLines(body: ReadableStream<Uint8Array>): Promise<void> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const flush = (text: string): void => {
+    for (const message of parseSseEvents(text)) {
+      process.stdout.write(`${JSON.stringify(message)}\n`);
+    }
+  };
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lastBreak = buffer.lastIndexOf("\n\n");
+      if (lastBreak !== -1) {
+        flush(buffer.slice(0, lastBreak + 2));
+        buffer = buffer.slice(lastBreak + 2);
+      }
+    }
+    buffer += decoder.decode();
+    flush(buffer.endsWith("\n\n") ? buffer : `${buffer}\n\n`);
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
 }
 
 /**
@@ -794,12 +1030,19 @@ export async function runStdioShim(options: ShimOptions): Promise<void> {
         if (candidate.jsonrpc !== "2.0") continue;
         connectionEra ??= candidate.method === "initialize" ? "legacy" : "modern";
         const outcome = await engine.handle(candidate);
+        for (const entry of outcome.notifications ?? []) {
+          process.stdout.write(`${JSON.stringify(entry)}\n`);
+        }
         if (outcome.messages.length > 0) {
           for (const entry of outcome.messages) {
             if (entry.id !== undefined || entry.error !== undefined) {
               process.stdout.write(`${JSON.stringify(entry)}\n`);
             }
           }
+        }
+        if (outcome.stream) {
+          // A stdio client has no SSE channel; decode the stream into JSON lines.
+          await writeStreamAsLines(outcome.stream);
         }
       }
     };
