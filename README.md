@@ -1,5 +1,7 @@
 # mcp-dual
 
+[한국어](README.ko.md) · English
+
 **Stateless MCP (`2026-07-28`) migration kit for TypeScript servers: a live compatibility probe, a dual-era shim proxy, and a codemod.**
 
 [![spec](https://img.shields.io/badge/MCP-2026--07--28-blue)](https://modelcontextprotocol.io/specification/2026-07-28)
