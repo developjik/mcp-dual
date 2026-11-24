@@ -53,6 +53,24 @@ for (const [name, eol] of [["LF", "\n"], ["CRLF", "\r\n"], ["CR", "\r"]] as cons
       expect(cancel).toHaveBeenCalledOnce();
     });
 
+    it("decodes UTF-8 characters split across byte-sized chunks", async () => {
+      const encoded = new TextEncoder().encode(event);
+      const cancel = vi.fn();
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (let i = 0; i < encoded.length; i++) controller.enqueue(encoded.slice(i, i + 1));
+        },
+        cancel,
+      });
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(stream, {
+        headers: { "content-type": "text/event-stream" },
+      }));
+      const response = await postJsonRpc("http://localhost/mcp", request, { timeoutMs: 250 });
+      expect(response.messages).toEqual([result]);
+      expect(response.bodyText).not.toContain("\uFFFD");
+      expect(cancel).toHaveBeenCalledOnce();
+    });
+
     it("works over real HTTP while the server keeps the response open", async () => {
       let server: Server | undefined;
       try {
