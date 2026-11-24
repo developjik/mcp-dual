@@ -1,5 +1,5 @@
 // Production-only package smoke test. Deliberately does not import Vitest.
-import {mkdtempSync,readFileSync,rmSync,writeFileSync,mkdirSync} from 'node:fs';
+import {existsSync,mkdtempSync,readFileSync,rmSync,writeFileSync,mkdirSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join,resolve} from 'node:path';
 import {spawnSync} from 'node:child_process';
@@ -7,6 +7,9 @@ const root=process.cwd();const pkg=JSON.parse(readFileSync(join(root,'package.js
 const temp=mkdtempSync(join(tmpdir(),'runtime-package-'));
 function run(command,args,cwd=root){const result=spawnSync(command,args,{cwd,encoding:'utf8',env:process.env});if(result.status!==0)throw new Error(`${command} failed (${result.status}): ${result.stderr} ${result.stdout}`);return result.stdout;}
 try{
+ const clean=join(temp,'clean');mkdirSync(clean);
+ run('npm',['install','--omit=dev','--no-audit','--no-fund',join(temp,JSON.parse(run('npm',['pack','--ignore-scripts','--json','--pack-destination',temp]))[0].filename)],clean);
+ for(const bin of ['tsc','tsserver'])if(existsSync(join(clean,'node_modules','.bin',bin)))throw new Error(`unexpected consumer bin ${bin}`);
  run('npm',['install','--save-prod','--no-audit','--no-fund','typescript@7.0.2'],temp);
  const compiler=join(temp,'node_modules','.bin','tsc');
  const compilerBefore=run(compiler,['--version'],temp);
