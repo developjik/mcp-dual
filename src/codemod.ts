@@ -1,7 +1,7 @@
 /* mcp-dual:ignore-file */
 import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { extname, join, relative, resolve } from "node:path";
-import ts from "typescript";
+import ts from "typescript-compiler-api";
 
 export interface CodemodChange {
   ruleId: string;
