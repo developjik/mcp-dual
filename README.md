@@ -273,6 +273,6 @@ MIT © 2026 Inkwon Jung
 
 Use Node.js 22.12.0 (`.nvmrc`) for development and CI. Vitest 5.1.1 requires Node 22.12+ on its supported release lines; Node 20.19 is outside its declared development support range. It may execute there, but CI does not treat that as supported test-runner usage. This development requirement does not change the package engine declaration. Runtime compatibility must be checked using the built package, separately from the test runner. TypeScript 7.0.2 is the development compiler baseline.
 
-The codemod intentionally keeps TypeScript Compiler API 6.0.3 as a runtime alias (`typescript-compiler-api`); TypeScript 7.0.2 provides the development CLI but does not export the AST API this tool uses. This is a documented runtime exception, not a second development compiler.
+The codemod intentionally keeps TypeScript Compiler API 6.0.3 as a development-only alias (`typescript-compiler-api`), copied with its license into the runtime build; TypeScript 7.0.2 provides the development CLI but does not export the AST API this tool uses. This is a documented runtime exception, not a second development compiler.
 
 The compiler API alias is development-only. Build copies its unchanged runtime and license into dist; consumer installs create no compiler bin. Development scripts invoke TypeScript7 by explicit path to avoid bin collisions.
