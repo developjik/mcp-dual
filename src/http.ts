@@ -208,10 +208,10 @@ export function parseJsonRpcBody(body: string): JsonRpcMessage[] {
 /** Extract JSON-RPC messages from an SSE stream chunk. */
 export function parseSseEvents(text: string): JsonRpcMessage[] {
   const messages: JsonRpcMessage[] = [];
-  const events = text.split(/\r?\n\r?\n/);
+  const events = text.replace(/\r\n|\r/g, "\n").split("\n\n");
   for (const event of events) {
     const dataLines: string[] = [];
-    for (const line of event.split(/\r?\n/)) {
+    for (const line of event.split("\n")) {
       if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
     }
     if (dataLines.length === 0) continue;
@@ -249,6 +249,15 @@ async function readResponseBody(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  // A CR ends a line immediately. If the next chunk begins with LF, consume
+  // that LF as part of the same newline instead of inventing an empty line.
+  let previousChunkEndedWithCr = false;
+  const normalizeNewlines = (chunk: string): string => {
+    if (!chunk) return "";
+    const skipLeadingLf = previousChunkEndedWithCr && chunk.startsWith("\n");
+    previousChunkEndedWithCr = chunk.endsWith("\r");
+    return chunk.slice(skipLeadingLf ? 1 : 0).replace(/\r\n|\r/g, "\n");
+  };
   let text = "";
   let messages: JsonRpcMessage[] = [];
   let timedOut = false;
@@ -271,14 +280,15 @@ async function readResponseBody(
         break;
       }
       if (outcome.chunk.done) {
-        buffer += decoder.decode();
-        text += buffer;
+        const finalText = decoder.decode();
+        text += finalText;
+        buffer += normalizeNewlines(finalText);
         messages = messages.concat(parseSseEvents(buffer));
         break;
       }
       const chunkText = decoder.decode(outcome.chunk.value, { stream: true });
       text += chunkText;
-      buffer += chunkText;
+      buffer += normalizeNewlines(chunkText);
       // Process complete SSE events; keep the trailing partial event buffered.
       const lastBreak = buffer.lastIndexOf("\n\n");
       if (lastBreak !== -1) {
@@ -293,6 +303,7 @@ async function readResponseBody(
     }
   } finally {
     if (timer) clearTimeout(timer);
+    reader.releaseLock();
   }
   return { text, messages, timedOut };
 }
