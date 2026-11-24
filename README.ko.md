@@ -268,3 +268,9 @@ bin/cli.ts    check | shim | codemod
 ## 라이선스
 
 MIT © 2026 Inkwon Jung
+
+## 개발 기준선 (DEV-128)
+
+개발과 CI는 Node.js 22.12.0(`.nvmrc`) 이상을 사용합니다. Vitest 5.1.1의 공식 지원 범위에는 Node 20.19가 없습니다. 실행이 된다는 이유로 공식 지원이라고 부르지 않습니다. 패키지 사용자의 기존 engines는 유지합니다. Node 20 지원 패키지는 테스트 러너 없이 빌드한 tarball의 운영 의존성만 설치하고 CLI/import를 별도로 검사합니다. 개발 TypeScript 기준은 7.0.2입니다.
+
+런타임 codemod는 기존 AST API가 필요해 TypeScript6.0.3을 typescript-compiler-api alias로 유지합니다. 개발컴파일러는 TypeScript7.0.2로 분리합니다.
