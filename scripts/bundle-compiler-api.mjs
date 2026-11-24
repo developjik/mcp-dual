@@ -7,3 +7,4 @@ const path='dist/src/codemod.js';
 const source=readFileSync(path,'utf8');
 if(!source.includes('"typescript-compiler-api"'))throw new Error('Compiler API import not found');
 writeFileSync(path,source.replace('"typescript-compiler-api"','"../vendor/typescript/typescript.cjs"'));
+copyFileSync('node_modules/typescript-compiler-api/ThirdPartyNoticeText.txt','dist/vendor/typescript/ThirdPartyNoticeText.txt');
